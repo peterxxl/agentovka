@@ -2,11 +2,13 @@
 
 ISDS permanently deletes messages 90 days after delivery, and the Portál
 občana auto-archiving is known to miss messages delivered by fiction. This
-archive keeps everything that passes through ``download_message``:
+archive keeps everything that passes through ``download_message`` (received)
+and ``download_sent_message`` (sent). Direction is recorded on each row so the
+archive covers both sides of the correspondence:
 
-    <archive_dir>/<environment>/<message_id>/
+    <archive_dir>/<environment>/<message_id>/<direction>/
         message.zfo          - original signed message, verbatim
-        metadata.json        - envelope, timestamps, sha256 of the ZFO
+        metadata.json        - envelope, direction, timestamps, sha256 of the ZFO
         attachments/<name>   - extracted files
 
 plus an SQLite database (index.db) with an FTS5 full-text index over subject,
@@ -25,7 +27,7 @@ from typing import Any
 
 from isds_client.models import DeliveryEvent, DmFile, MessageEnvelope
 
-_SCHEMA = """
+_MESSAGES_SCHEMA = """
 CREATE TABLE IF NOT EXISTS messages (
     message_id TEXT NOT NULL,
     environment TEXT NOT NULL,
@@ -36,11 +38,16 @@ CREATE TABLE IF NOT EXISTS messages (
     acceptance_time TEXT,
     status INTEGER,
     zfo_sha256 TEXT,
+    direction TEXT NOT NULL DEFAULT 'received',
     archived_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%SZ', 'now')),
-    PRIMARY KEY (message_id, environment)
-);
+    subdirectory TEXT NOT NULL,
+    PRIMARY KEY (message_id, environment, direction)
+)
+"""
+
+_SEARCH_SCHEMA = """
 CREATE VIRTUAL TABLE IF NOT EXISTS messages_fts USING fts5(
-    message_id, environment UNINDEXED, subject, sender, recipient, body
+    message_id, environment UNINDEXED, direction UNINDEXED, subject, sender, recipient, body
 );
 """
 
@@ -61,6 +68,17 @@ _SAFE_COMPONENT = re.compile(r"^[A-Za-z0-9_.-]+$")
 
 class UnsafeIdentifierError(ValueError):
     """A message_id is not a safe filesystem path component."""
+
+
+# received = downloaded from the received store (SignedMessageDownload).
+# sent = downloaded from the sent store (SignedSentMessageDownload).
+_DIRECTIONS = frozenset({"received", "sent"})
+
+
+def _require_direction(direction: str) -> str:
+    if direction not in _DIRECTIONS:
+        raise ValueError("direction must be 'received' or 'sent'")
+    return direction
 
 
 def _safe_component(value: str) -> str:
@@ -92,6 +110,7 @@ def safe_filename(name: str) -> str:
 class ArchivedMessage:
     message_id: str
     environment: str
+    direction: str
     subject: str | None
     sender: str | None
     recipient: str | None
@@ -108,8 +127,45 @@ class Archive:
         self.root.mkdir(parents=True, exist_ok=True)
         self._db = sqlite3.connect(self.root / "index.db")
         self._db.row_factory = sqlite3.Row
-        self._db.executescript(_SCHEMA)
-        self._db.commit()
+        self._initialize_schema()
+
+    def _initialize_schema(self) -> None:
+        with self._db:
+            self._db.execute("BEGIN IMMEDIATE")
+            columns = {row["name"] for row in self._db.execute("PRAGMA table_info(messages)")}
+            if "subdirectory" in columns:
+                return
+            if columns:
+                self._db.execute("ALTER TABLE messages RENAME TO old_messages")
+            old_search = self._db.execute("PRAGMA table_info(messages_fts)").fetchone() is not None
+            if old_search:
+                self._db.execute("ALTER TABLE messages_fts RENAME TO old_search")
+            self._db.execute(_MESSAGES_SCHEMA)
+            self._db.execute(_SEARCH_SCHEMA)
+            if not columns:
+                return
+
+            # Both prior layouts used <environment>/<id> for the only copy.
+            # Preserve those paths, timestamps and any indexed attachment text.
+            fields = (
+                "message_id, environment, subject, sender, recipient, delivery_time, "
+                "acceptance_time, status, zfo_sha256, archived_at"
+            )
+            direction = "direction" if "direction" in columns else "'received'"
+            self._db.execute(
+                f"INSERT INTO messages ({fields}, direction, subdirectory) "
+                f"SELECT {fields}, {direction}, '' FROM old_messages"
+            )
+            if old_search:
+                self._db.execute(
+                    """INSERT INTO messages_fts
+                       (message_id, environment, direction, subject, sender, recipient, body)
+                       SELECT f.message_id, f.environment, m.direction,
+                              f.subject, f.sender, f.recipient, f.body
+                       FROM old_search f JOIN messages m USING (message_id, environment)"""
+                )
+                self._db.execute("DROP TABLE old_search")
+            self._db.execute("DROP TABLE old_messages")
 
     def close(self) -> None:
         self._db.close()
@@ -122,10 +178,20 @@ class Archive:
         zfo_bytes: bytes,
         files: list[DmFile],
         events: list[DeliveryEvent] | None = None,
+        *,
+        direction: str = "received",
     ) -> Path:
-        """Persist a downloaded message; idempotent per (message_id, environment)."""
+        """Store a copy keyed by environment, message ID and direction."""
+        direction = _require_direction(direction)
         message_id = _safe_component(envelope.message_id)
-        msg_dir = self.root / self.environment / message_id
+        key = (message_id, self.environment, direction)
+        row = self._db.execute(
+            "SELECT subdirectory FROM messages WHERE message_id = ? AND environment = ? "
+            "AND direction = ?",
+            key,
+        ).fetchone()
+        subdirectory = row["subdirectory"] if row is not None else direction
+        msg_dir = self.root / self.environment / message_id / subdirectory
         att_dir = msg_dir / "attachments"
         att_dir.mkdir(parents=True, exist_ok=True)
 
@@ -149,6 +215,7 @@ class Archive:
         metadata = {
             "envelope": envelope.model_dump(mode="json", by_alias=True),
             "environment": self.environment,
+            "direction": direction,
             "zfo_sha256": hashlib.sha256(zfo_bytes).hexdigest(),
             "attachments": saved_files,
             "delivery_events": [e.model_dump(mode="json", by_alias=True) for e in (events or [])],
@@ -159,14 +226,15 @@ class Archive:
 
         with self._db:
             self._db.execute(
-                "DELETE FROM messages_fts WHERE message_id = ? AND environment = ?",
-                (message_id, self.environment),
+                "DELETE FROM messages_fts WHERE message_id = ? AND environment = ? "
+                "AND direction = ?",
+                key,
             )
             self._db.execute(
                 """INSERT OR REPLACE INTO messages
                    (message_id, environment, subject, sender, recipient,
-                    delivery_time, acceptance_time, status, zfo_sha256)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                    delivery_time, acceptance_time, status, zfo_sha256, direction, subdirectory)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     envelope.message_id,
                     self.environment,
@@ -177,14 +245,15 @@ class Archive:
                     envelope.acceptance_time.isoformat() if envelope.acceptance_time else None,
                     int(envelope.status) if envelope.status is not None else None,
                     metadata["zfo_sha256"],
+                    direction,
+                    subdirectory,
                 ),
             )
             self._db.execute(
-                "INSERT INTO messages_fts (message_id, environment, subject, sender, recipient,"
-                " body) VALUES (?, ?, ?, ?, ?, ?)",
+                "INSERT INTO messages_fts (message_id, environment, direction, subject, sender,"
+                " recipient, body) VALUES (?, ?, ?, ?, ?, ?, ?)",
                 (
-                    message_id,
-                    self.environment,
+                    *key,
                     envelope.subject or "",
                     envelope.sender_name or "",
                     envelope.recipient_name or "",
@@ -199,62 +268,106 @@ class Archive:
         return ArchivedMessage(
             message_id=row["message_id"],
             environment=row["environment"],
+            direction=row["direction"],
             subject=row["subject"],
             sender=row["sender"],
             recipient=row["recipient"],
             delivery_time=row["delivery_time"],
             acceptance_time=row["acceptance_time"],
             archived_at=row["archived_at"],
-            directory=self.root / row["environment"] / row["message_id"],
+            directory=self.root / row["environment"] / row["message_id"] / row["subdirectory"],
         )
 
-    def list_messages(self, limit: int = 100) -> list[ArchivedMessage]:
-        rows = self._db.execute(
-            "SELECT * FROM messages WHERE environment = ? ORDER BY delivery_time DESC LIMIT ?",
-            (self.environment, limit),
-        ).fetchall()
+    def list_messages(
+        self, limit: int = 100, *, direction: str | None = None
+    ) -> list[ArchivedMessage]:
+        if direction is None:
+            rows = self._db.execute(
+                "SELECT * FROM messages WHERE environment = ? ORDER BY delivery_time DESC LIMIT ?",
+                (self.environment, limit),
+            ).fetchall()
+        else:
+            direction = _require_direction(direction)
+            rows = self._db.execute(
+                "SELECT * FROM messages WHERE environment = ? AND direction = ? "
+                "ORDER BY delivery_time DESC LIMIT ?",
+                (self.environment, direction, limit),
+            ).fetchall()
         return [self._row_to_message(r) for r in rows]
 
-    def search(self, query: str, limit: int = 50) -> list[ArchivedMessage]:
+    def search(
+        self, query: str, limit: int = 50, *, direction: str | None = None
+    ) -> list[ArchivedMessage]:
         """Full-text search over subject/sender/recipient/attachment text.
 
         The query is passed to FTS5 as-is first (so advanced syntax works); if
         FTS5 rejects it (slashes, colons, unbalanced quotes - e.g. a case
         number like "123/2026"), it is retried as a quoted literal phrase.
+        ``direction``, when set, restricts hits to ``received`` or ``sent``.
         """
-        sql = """SELECT m.* FROM messages_fts f
-               JOIN messages m ON m.message_id = f.message_id AND m.environment = f.environment
-               WHERE messages_fts MATCH ? AND f.environment = ?
+        extra: tuple[Any, ...] = (limit,)
+        direction_sql = ""
+        if direction is not None:
+            direction = _require_direction(direction)
+            direction_sql = " AND m.direction = ?"
+            extra = (direction, limit)
+        sql = f"""SELECT m.* FROM messages_fts f
+               JOIN messages m USING (message_id, environment, direction)
+               WHERE messages_fts MATCH ? AND f.environment = ?{direction_sql}
                ORDER BY rank LIMIT ?"""
+
+        def _run(q: str) -> list[sqlite3.Row]:
+            return self._db.execute(sql, (q, self.environment, *extra)).fetchall()
+
         try:
-            rows = self._db.execute(sql, (query, self.environment, limit)).fetchall()
+            rows = _run(query)
         except sqlite3.OperationalError:
             phrase = '"' + query.replace('"', '""') + '"'
-            rows = self._db.execute(sql, (phrase, self.environment, limit)).fetchall()
+            rows = _run(phrase)
         return [self._row_to_message(r) for r in rows]
 
-    def get(self, message_id: str) -> dict[str, Any] | None:
-        """Load metadata.json for one archived message, or None."""
+    def get(self, message_id: str, *, direction: str | None = None) -> dict[str, Any] | None:
+        """Read a copy by ID. When both copies exist, the caller must choose one."""
         try:
             message_id = _safe_component(message_id)
         except UnsafeIdentifierError:
             return None
-        meta_path = self.root / self.environment / message_id / "metadata.json"
-        if not meta_path.exists():
+        if direction is not None:
+            _require_direction(direction)
+        rows = self._db.execute(
+            "SELECT direction, subdirectory FROM messages WHERE message_id = ? AND environment = ?",
+            (message_id, self.environment),
+        ).fetchall()
+        if direction is None and len(rows) > 1:
+            raise ValueError("Both copies are archived. Specify direction='received' or 'sent'.")
+        base = self.root / self.environment / message_id
+        row = None
+        if rows:
+            row = next((r for r in rows if direction is None or r["direction"] == direction), None)
+            if row is None:
+                return None
+            base /= row["subdirectory"]
+        meta_path = base / "metadata.json"
+        if not meta_path.is_file():
             return None
         data: dict[str, Any] = json.loads(meta_path.read_text(encoding="utf-8"))
-        data["directory"] = str(meta_path.parent)
+        # Unindexed metadata from older archives may omit direction.
+        data["direction"] = (
+            row["direction"] if row is not None else data.get("direction", "received")
+        )
+        if direction is not None and data["direction"] != direction:
+            return None
+        data["directory"] = str(base)
         return data
 
-    def read_attachment(self, message_id: str, file_name: str) -> bytes | None:
-        try:
-            message_id = _safe_component(message_id)
-        except UnsafeIdentifierError:
+    def read_attachment(
+        self, message_id: str, file_name: str, *, direction: str | None = None
+    ) -> bytes | None:
+        metadata = self.get(message_id, direction=direction)
+        if metadata is None:
             return None
-        att = self.root / self.environment / message_id / "attachments" / file_name
-        # Guard against path traversal via crafted file names.
-        if not att.resolve().is_relative_to((self.root / self.environment).resolve()):
-            return None
-        if not att.exists():
+        directory = Path(metadata["directory"]) / "attachments"
+        att = directory / file_name
+        if att.resolve().parent != directory.resolve() or not att.is_file():
             return None
         return att.read_bytes()

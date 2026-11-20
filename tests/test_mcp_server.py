@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64
+import inspect
 from pathlib import Path
 from typing import Any
 
@@ -11,14 +12,21 @@ import pytest
 import agentovka_mcp.server as server
 from agentovka_mcp.archive import Archive
 from agentovka_mcp.config import Settings
+from conftest import build_cms, message_xml
 from isds_client.client import IsdsEnvironment
+from isds_client.errors import IsdsResponseError
 
 
 class _StubClient:
     def __init__(self) -> None:
         self.received_called = False
         self.download_called = False
+        self.download_id: str | None = None
+        self.sent_download_called = False
+        self.sent_download_id: str | None = None
         self.sent_message: dict[str, Any] | None = None
+        self.zfo = b""
+        self.sent_zfo = b""
 
     def get_list_of_received_messages(self, limit: int = 100) -> list[Any]:
         self.received_called = True
@@ -26,7 +34,13 @@ class _StubClient:
 
     def signed_message_download(self, message_id: str) -> bytes:
         self.download_called = True
-        return b""
+        self.download_id = message_id
+        return self.zfo
+
+    def signed_sent_message_download(self, message_id: str) -> bytes:
+        self.sent_download_called = True
+        self.sent_download_id = message_id
+        return self.sent_zfo
 
     def create_message(self, recipient_id: str, subject: str, files: list[Any], **kw: Any) -> str:
         self.sent_message = {"recipient": recipient_id, "subject": subject, "files": files}
@@ -66,6 +80,120 @@ def test_download_requires_acknowledgement(reset_singletons: _StubClient) -> Non
     result = server.download_message("123", acknowledge_delivery_trigger=False)
     assert result["error"] == "delivery_trigger_not_acknowledged"
     assert reset_singletons.download_called is False
+    assert reset_singletons.sent_download_called is False
+
+
+def test_download_received_records_direction(
+    reset_singletons: _StubClient, sample_zfo: bytes
+) -> None:
+    reset_singletons.zfo = sample_zfo
+    result = server.download_message("10123456", acknowledge_delivery_trigger=True)
+    assert result["delivery_triggered"] is True
+    assert result["direction"] == "received"
+    assert reset_singletons.download_called is True
+    assert reset_singletons.sent_download_called is False
+    assert result["envelope"]["message_id"] == "10123456"
+    assert result["attachments"][0]["file_name"] == "rozhodnuti.pdf"
+
+    listed = server.list_archived_messages()
+    assert listed["messages"][0]["direction"] == "received"
+    assert server.list_archived_messages(direction="sent")["messages"] == []
+
+
+def test_download_sent_message_archives_without_delivery_ack(
+    reset_singletons: _StubClient, sample_zfo: bytes
+) -> None:
+    """Sent download is class A: no acknowledge_delivery_trigger, direction=sent."""
+    assert (
+        "acknowledge_delivery_trigger"
+        not in inspect.signature(server.download_sent_message).parameters
+    )
+
+    reset_singletons.sent_zfo = sample_zfo
+    result = server.download_sent_message("10123456")
+    assert "error" not in result
+    assert result["delivery_triggered"] is False
+    assert result["direction"] == "sent"
+    assert reset_singletons.sent_download_called is True
+    assert reset_singletons.sent_download_id == "10123456"
+    assert reset_singletons.download_called is False
+    assert reset_singletons.received_called is False
+    assert (Path(result["archived_to"]) / "message.zfo").read_bytes() == sample_zfo
+    assert (Path(result["archived_to"]) / "attachments" / "rozhodnuti.pdf").read_bytes() == (
+        b"%PDF-1.4 fake"
+    )
+
+    listed = server.list_archived_messages()
+    assert listed["messages"][0]["message_id"] == "10123456"
+    assert listed["messages"][0]["direction"] == "sent"
+    assert server.list_archived_messages(direction="received")["messages"] == []
+    assert server.list_archived_messages(direction="sent")["messages"][0]["direction"] == "sent"
+
+    read = server.read_archived_message("10123456")
+    assert read["direction"] == "sent"
+    assert read["envelope"]["message_id"] == "10123456"
+    assert "dmID" not in read["envelope"]
+
+    hits = server.search_archive("přestupku")
+    assert hits["messages"] == [
+        {
+            "message_id": "10123456",
+            "direction": "sent",
+            "subject": "Rozhodnutí o přestupku",
+            "sender": "Městský úřad Testov",
+        }
+    ]
+    sent_hits = server.search_archive("přestupku", direction="sent")
+    assert sent_hits["messages"][0]["direction"] == "sent"
+    assert server.search_archive("přestupku", direction="received")["messages"] == []
+
+
+@pytest.mark.parametrize("first", ["sent", "received"])
+def test_download_both_copies_of_same_message(reset_singletons: _StubClient, first: str) -> None:
+    message_id = "10123456"
+    copies = {
+        direction: build_cms(message_xml(subject=direction, attachment_bytes=direction.encode()))
+        for direction in ("received", "sent")
+    }
+    reset_singletons.zfo = copies["received"]
+    reset_singletons.sent_zfo = copies["sent"]
+    other = "sent" if first == "received" else "received"
+    for direction in (first, other, first):
+        if direction == "sent":
+            result = server.download_sent_message(message_id)
+        else:
+            result = server.download_message(message_id, acknowledge_delivery_trigger=True)
+        assert result["direction"] == direction
+
+    assert "direction" in server.read_archived_message(message_id)["error"]
+    assert sorted(m["direction"] for m in server.list_archived_messages()["messages"]) == [
+        "received",
+        "sent",
+    ]
+    for direction, zfo in copies.items():
+        meta = server.read_archived_message(message_id, direction=direction)
+        assert meta["direction"] == meta["envelope"]["subject"] == direction
+        directory = Path(meta["directory"])
+        assert (directory / "message.zfo").read_bytes() == zfo
+        assert (directory / "attachments" / "rozhodnuti.pdf").read_bytes() == direction.encode()
+        hits = server.search_archive(direction)["messages"]
+        assert [(m["message_id"], m["direction"]) for m in hits] == [(message_id, direction)]
+
+
+def test_download_sent_message_surfaces_isds_error(reset_singletons: _StubClient) -> None:
+    def boom(message_id: str) -> bytes:
+        raise IsdsResponseError("1219", "Zpráva 999 není v databázi.")
+
+    reset_singletons.signed_sent_message_download = boom  # type: ignore[method-assign]
+    result = server.download_sent_message("999")
+    assert "1219" in result["error"]
+    assert "delivery_triggered" not in result
+    assert server.list_archived_messages()["messages"] == []
+
+
+def test_archive_tools_reject_bad_direction(reset_singletons: _StubClient) -> None:
+    assert "error" in server.list_archived_messages(direction="outgoing")
+    assert "error" in server.search_archive("věc", direction="outgoing")
 
 
 def test_send_dry_run_is_default(reset_singletons: _StubClient) -> None:
@@ -203,7 +331,7 @@ def test_search_archive_reports_bad_query_as_error(
 ) -> None:
     import sqlite3
 
-    def boom(query: str, limit: int = 50) -> list[Any]:
+    def boom(query: str, limit: int = 50, *, direction: str | None = None) -> list[Any]:
         raise sqlite3.OperationalError("fts5: syntax error")
 
     monkeypatch.setattr(server.get_archive(), "search", boom)
