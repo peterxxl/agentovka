@@ -179,8 +179,14 @@ def list_archived_messages(
 )
 def read_archived_message(
     message_id: Annotated[str, Field(description="ISDS message ID (dmID)")],
+    direction: Annotated[
+        str | None, Field(description="Choose 'received' or 'sent' if both copies are archived.")
+    ] = None,
 ) -> dict[str, Any]:
-    data = get_archive().get(message_id)
+    try:
+        data = get_archive().get(message_id, direction=direction)
+    except ValueError as exc:
+        return {"error": str(exc)}
     if data is None:
         return {"error": f"Message {message_id} is not in the local archive."}
     # metadata.json stores the envelope under ISDS alias keys (dmID, ...);
