@@ -105,7 +105,7 @@ def test_direction_recorded_and_filterable(tmp_path: Path, sample_zfo: bytes) ->
 
     parsed.envelope.message_id = "20202020"
     parsed.envelope.subject = "Odeslané podání"
-    archive.store(parsed.envelope, sample_zfo, parsed.files, direction="sent")
+    sent_dir = archive.store(parsed.envelope, sample_zfo, parsed.files, direction="sent")
 
     by_id = {m.message_id: m.direction for m in archive.list_messages()}
     assert by_id == {"10123456": "received", "20202020": "sent"}
@@ -116,18 +116,16 @@ def test_direction_recorded_and_filterable(tmp_path: Path, sample_zfo: bytes) ->
     sent = archive.get("20202020")
     assert sent is not None
     assert sent["direction"] == "sent"
-    assert (
-        json.loads((tmp_path / "archive" / "test" / "20202020" / "metadata.json").read_text())[
-            "direction"
-        ]
-        == "sent"
-    )
+    assert json.loads((sent_dir / "metadata.json").read_text())["direction"] == "sent"
 
     with pytest.raises(ValueError, match="direction"):
         archive.store(parsed.envelope, sample_zfo, parsed.files, direction="out")
 
 
-def test_direction_column_migrates_existing_archive(tmp_path: Path) -> None:
+@pytest.mark.parametrize("legacy_direction", [None, "sent"])
+def test_direction_column_migrates_existing_archive(
+    tmp_path: Path, sample_zfo: bytes, legacy_direction: str | None
+) -> None:
     """Archives created before direction existed default stored rows to received."""
     import sqlite3
 
@@ -153,6 +151,15 @@ def test_direction_column_migrates_existing_archive(tmp_path: Path) -> None:
         VALUES ('10123456', 'test', 'Stará zpráva', 'Úřad');
         """
     )
+    db.executescript(
+        """CREATE VIRTUAL TABLE messages_fts USING fts5(
+            message_id, environment UNINDEXED, subject, sender, recipient, body
+        );
+        INSERT INTO messages_fts VALUES ('10123456', 'test', '', '', '', 'legacybody');"""
+    )
+    if legacy_direction:
+        db.execute("ALTER TABLE messages ADD COLUMN direction TEXT NOT NULL DEFAULT 'received'")
+        db.execute("UPDATE messages SET direction = ?", (legacy_direction,))
     db.commit()
     db.close()
 
@@ -164,11 +171,24 @@ def test_direction_column_migrates_existing_archive(tmp_path: Path) -> None:
     )
 
     archive = Archive(root, environment="test")
-    listed = archive.list_messages()
-    assert [(m.message_id, m.direction) for m in listed] == [("10123456", "received")]
-    loaded = archive.get("10123456")
-    assert loaded is not None
-    assert loaded["direction"] == "received"
+    direction = legacy_direction or "received"
+    other = "sent" if direction == "received" else "received"
+    parsed = parse_zfo(sample_zfo)
+    archive.store(parsed.envelope, sample_zfo, parsed.files, direction=other)
+    archive.close()
+
+    archive = Archive(root, environment="test")
+    assert {m.direction for m in archive.list_messages()} == {direction, other}
+    assert [m.direction for m in archive.search("legacybody")] == [direction]
+    legacy = archive.get("10123456", direction=direction)
+    assert legacy is not None and legacy["direction"] == direction
+    assert Path(legacy["directory"]) == msg_dir
+    assert legacy["envelope"]["dmAnnotation"] == "Stará zpráva"
+    assert archive.read_attachment("10123456", "rozhodnuti.pdf", direction=other) == (
+        b"%PDF-1.4 fake"
+    )
+    assert archive.read_attachment("10123456", "rozhodnuti.pdf", direction=direction) is None
+    archive.close()
 
 
 def test_fts_index_is_environment_scoped(tmp_path: Path, sample_zfo: bytes) -> None:
